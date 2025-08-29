@@ -165,7 +165,15 @@ class KeysightScope:
     # --- Acquisition helpers ---
     def single(self):
         self.ensure()
-        self.inst.write(":STOP"); self.inst.write(":DIG")
+        self.inst.write(":SINGle")
+
+    def run(self):
+        self.ensure()
+        self.inst.write(":RUN")
+
+    def stop(self):
+        self.ensure()
+        self.inst.write(":STOP")
 
     # --- Channels ---
     def chan_apply(self, n:int, disp:str, coup:str, bwl:str, inv:str, scale_v:float, offs_v:float, probe:float):

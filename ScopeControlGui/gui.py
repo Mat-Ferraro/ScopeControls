@@ -67,6 +67,8 @@ class App:
 
         ttk.Button(tb, text="Apply (Alt+A)", command=self.apply_timebase, underline=7).grid(row=2, column=4, sticky="e")
         ttk.Button(tb, text="Single (Alt+S)", command=self.single, underline=0).grid(row=2, column=5, sticky="w")
+        ttk.Button(tb, text="Run",  command=self.run_scope).grid(row=2, column=6, sticky="w")
+        ttk.Button(tb, text="Stop", command=self.stop_scope).grid(row=2, column=7, sticky="w")
 
         # Vertical controls (tabs CH1..CH4)
         vert = ttk.LabelFrame(top, text="Vertical Controls")
@@ -241,6 +243,23 @@ class App:
             self.status.set("Single acquisition armed.")
         except Exception as e:
             messagebox.showerror("Single failed", str(e))
+
+    def run_scope(self):
+        try:
+            self.scope.run()
+            self.status.set("Acquisition RUN.")
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Run failed", str(e))
+
+    def stop_scope(self):
+        try:
+            self.scope.stop()
+            self.status.set("Acquisition STOP.")
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Stop failed", str(e))
+
 
     # --- Channel panel ---
     def build_channel_panel(self, frame: ttk.Frame, n: int):
