@@ -6,37 +6,128 @@ import pyvisa
 from units import parse_time_s, parse_volt_v, fmt_s, fmt_v
 from meas import UNIT_FORMATTERS
 
+# Backends we’ll try (order matters). You can override with env: VISA_BACKEND=@ivi or @ni or a full DLL path.
+_BACKEND_HINTS = []
+if os.environ.get("VISA_BACKEND"):
+    _BACKEND_HINTS.append(os.environ["VISA_BACKEND"])
+_BACKEND_HINTS += [
+    "@ivi",                                   # Keysight VISA
+    r"C:\Windows\System32\visa64.dll",        # explicit 64-bit VISA (sometimes needed)
+    r"C:\Windows\System32\visa32.dll",        # some installs expose visa32.dll for 64-bit too
+    "@ni",                                    # NI-VISA (works if Tulip sees Keysight devices)
+]
+
 class KeysightScope:
     def __init__(self):
         self.rm = None
         self.inst = None
+        self._rm_hint_used = None  # which backend we actually loaded
 
     # --- Connection ---
     def list_resources(self):
+        """Return only Keysight scopes (DSOX/MSOX/InfiniiVision) on USB."""
         self._open_rm()
-        return list(self.rm.list_resources())
+        try:
+            usb_addrs = list(self.rm.list_resources("USB?*::INSTR"))
+        except Exception:
+            # If listing with the filter fails, fall back to everything
+            usb_addrs = list(self.rm.list_resources())
+
+        scopes = []
+        for addr in usb_addrs:
+            try:
+                inst = self.rm.open_resource(addr)
+                inst.timeout = 3000
+                inst.read_termination = "\n"
+                inst.write_termination = "\n"
+                idn = inst.query("*IDN?").strip().upper()
+                inst.close()
+
+                is_keysight = ("KEYSIGHT" in idn) or ("AGILENT" in idn) or ("HEWLETT-PACKARD" in idn)
+                is_scope = any(tag in idn for tag in (
+                    "DSOX", "MSOX", "INFINIIVISION", "1000X", "2000X", "3000X", "4000X", "6000X"
+                ))
+                if is_keysight and is_scope:
+                    scopes.append(addr)
+            except Exception:
+                # Ignore devices we can't open/query quickly
+                pass
+
+        # If we found scopes, show only those; otherwise show the raw USB list as a fallback
+        return scopes if scopes else usb_addrs
+
 
     def connect(self, resource):
         if self.inst is not None:
             try: self.inst.close()
             except Exception: pass
+
         self._open_rm()
-        inst = self.rm.open_resource(resource)
+
+        # Try to open; on NCIC retry once with the first alternate backend that initializes.
+        try:
+            inst = self.rm.open_resource(resource)
+        except pyvisa.errors.VisaIOError as e:
+            if getattr(e, "error_code", None) == -1073807264:  # VI_ERROR_NCIC
+                # Try alternate backend(s)
+                alt_rm, alt_hint = self._try_alternate_rm(excluding=self._rm_hint_used)
+                if alt_rm is not None:
+                    self.rm = alt_rm
+                    self._rm_hint_used = alt_hint
+                    # retry open once
+                    inst = self.rm.open_resource(resource)
+                else:
+                    lib = getattr(getattr(self.rm, "visalib", None), "library_path", "unknown VISA lib")
+                    raise RuntimeError(
+                        "VISA NCIC: The interface is not currently the controller in charge.\n"
+                        f"Resource: {resource}\nUsing VISA: {lib}\n\n"
+                        "Fixes:\n"
+                        " • Close Keysight Connection Expert / BenchVue or any app holding the scope.\n"
+                        " • Unplug/replug the USB cable.\n"
+                        " • In Keysight IO Libraries: set Keysight VISA as Primary (VISA Conflict Manager).\n"
+                        " • Or try the other backend (set VISA_BACKEND=@ni or @ivi) and restart."
+                    ) from e
+            else:
+                raise
+
         inst.timeout = 10000
         inst.read_termination = "\n"
         inst.write_termination = "\n"
-        # Bigger chunks for screenshots
+        # Bigger chunks for screenshots / waveform reads
         try:
-            inst.chunk_size = max(getattr(inst, "chunk_size", 20000), 1024*1024)
+            inst.chunk_size = max(getattr(inst, "chunk_size", 20000), 1024 * 1024)
         except Exception:
             pass
+
         idn = inst.query("*IDN?")
         self.inst = inst
         return idn
 
     def _open_rm(self):
-        if self.rm is None:
-            self.rm = pyvisa.ResourceManager()
+        if self.rm is not None:
+            return
+        last_err = None
+        for hint in _BACKEND_HINTS + [None]:   # None = auto-detect fallback
+            try:
+                self.rm = pyvisa.ResourceManager() if hint is None else pyvisa.ResourceManager(hint)
+                self._rm_hint_used = hint if hint is not None else "auto"
+                # print("Using VISA:", self.rm.visalib.library_path)
+                return
+            except Exception as e:
+                last_err = e
+        raise last_err  # if nothing worked, surface the last error
+
+    def _try_alternate_rm(self, excluding):
+        """Initialize a different ResourceManager than 'excluding'; return (rm, hint) or (None, None)."""
+        for hint in _BACKEND_HINTS + [None]:
+            if hint == excluding:
+                continue
+            try:
+                rm = pyvisa.ResourceManager() if hint is None else pyvisa.ResourceManager(hint)
+                return rm, (hint if hint is not None else "auto")
+            except Exception:
+                continue
+        return None, None
 
     def ensure(self):
         if self.inst is None:
@@ -114,7 +205,7 @@ class KeysightScope:
     def trig_apply(self, ttype:str, src:str, level_v:float, slope:str, coup:str, sweep:str, hold_s:float):
         self.ensure()
         self.inst.write(f":TRIG:MODE {ttype}")
-        self.inst.write(f":TRIG:EDGE:SOUR {src}")
+        self.inst.write(f":TRIG:EDGE:SOUR {src}")   # EDGE only wired
         self.inst.write(f":TRIG:EDGE:SLOP {slope}")
         self.inst.write(f":TRIG:EDGE:COUP {coup}")
         self.inst.write(f":TRIG:SWEEP {sweep}")
