@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run GUI",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/ScopeControlGui/main.py",
+      "cwd": "${workspaceFolder}/ScopeControlGui",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": { "PYTHONUNBUFFERED": "1" }
+    }
+  ]
+}
