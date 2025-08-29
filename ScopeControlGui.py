@@ -77,12 +77,18 @@ class ScopeGUI:
 
         # Timebase box
         self.mode = tk.StringVar(value="MAIN")
+        # NEW: keep UI in sync even if mode changes programmatically
+        self.mode.trace_add("write", lambda *_: self._update_mode_enabled())
+
         tb = ttk.LabelFrame(top, text="Timebase")
         tb.grid(row=2, column=0, columnspan=4, sticky="ew")
         for c in range(8): tb.columnconfigure(c, weight=1)
 
-        ttk.Radiobutton(tb, text="MAIN", variable=self.mode, value="MAIN").grid(row=0, column=0, padx=6, pady=6, sticky="w")
-        ttk.Radiobutton(tb, text="ZOOM (WINDow)", variable=self.mode, value="ZOOM").grid(row=0, column=1, padx=6, pady=6, sticky="w")
+        # NEW: wire radio buttons to updater so ZOOM enables the checkbox immediately
+        ttk.Radiobutton(tb, text="MAIN", variable=self.mode, value="MAIN",
+                        command=self._update_mode_enabled).grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        ttk.Radiobutton(tb, text="ZOOM (WINDow)", variable=self.mode, value="ZOOM",
+                        command=self._update_mode_enabled).grid(row=0, column=1, padx=6, pady=6, sticky="w")
 
         ttk.Label(tb, text="Sec/Div:").grid(row=1, column=0, sticky="e"); 
         self.ent_scale = ttk.Entry(tb, width=16); self.ent_scale.insert(0, "10ms"); self.ent_scale.grid(row=1, column=1, sticky="w", padx=4)
