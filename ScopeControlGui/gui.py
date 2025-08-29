@@ -119,7 +119,7 @@ class App:
             .grid(row=1, column=5, sticky="w", padx=4)
 
         ttk.Label(trig, text="Holdoff:").grid(row=2, column=0, sticky="e")
-        self.trig_hold = tk.StringVar(value="0s")
+        self.trig_hold = tk.StringVar(value="")  # blank by default to avoid sending 0 s
         ttk.Entry(trig, textvariable=self.trig_hold, width=10).grid(row=2, column=1, sticky="w", padx=4)
 
         ttk.Button(trig, text="Apply Trigger (Alt+T)", command=self.apply_trigger, underline=13)\
@@ -165,11 +165,36 @@ class App:
         ttk.Button(meas, text="Read All", command=self.meas_read_all).grid(row=5, column=5, sticky="w", pady=(6,8))
         ttk.Button(meas, text="Clear All", command=self.meas_clear_all).grid(row=5, column=6, sticky="w", pady=(6,8))
 
+        # --- CSV granularity state (used by Save / Export) ---
+        self.csv_gran = tk.StringVar(value="screen")   # 'screen' | 'max' | 'custom'
+        self.csv_points = tk.StringVar(value="10000")  # used when granularity == 'custom'
+
         # Save / Export
         exp = ttk.LabelFrame(top, text="Save / Export")
         exp.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10,0))
-        ttk.Button(exp, text="Screenshot (PNG)", command=self.export_screenshot).grid(row=0, column=0, sticky="w", padx=(8,4), pady=(4,6))
-        ttk.Button(exp, text="Save ALL Channels (CSV)", command=self.export_all_waveforms_csv).grid(row=0, column=1, sticky="w", padx=(4,8), pady=(4,6))
+        for c in range(6): exp.columnconfigure(c, weight=1)
+
+        # Granularity controls
+        ttk.Label(exp, text="CSV points:").grid(row=0, column=0, sticky="e", padx=(8,4), pady=(4,6))
+        ttk.Combobox(
+            exp, state="readonly", width=10, textvariable=self.csv_gran,
+            values=["screen","max","custom"]
+        ).grid(row=0, column=1, sticky="w", padx=(0,6), pady=(4,6))
+
+        self.ent_csv_points = ttk.Entry(exp, textvariable=self.csv_points, width=10)
+        self.ent_csv_points.grid(row=0, column=2, sticky="w", padx=(0,8), pady=(4,6))
+
+        # Buttons
+        ttk.Button(exp, text="Screenshot (PNG)", command=self.export_screenshot)\
+            .grid(row=0, column=3, sticky="w", padx=(8,4), pady=(4,6))
+        ttk.Button(exp, text="Save ALL Channels (CSV)", command=self.export_all_waveforms_csv)\
+            .grid(row=0, column=4, sticky="w", padx=(4,8), pady=(4,6))
+
+        # Enable/disable points entry based on selection
+        def _on_gran_change(*_):
+            self.ent_csv_points.configure(state=("normal" if self.csv_gran.get() == "custom" else "disabled"))
+        self.csv_gran.trace_add("write", _on_gran_change)
+        _on_gran_change()
 
         # Status bar
         self.status = tk.StringVar(value="Ready.")
@@ -259,7 +284,6 @@ class App:
         except Exception as e:
             from tkinter import messagebox
             messagebox.showerror("Stop failed", str(e))
-
 
     # --- Channel panel ---
     def build_channel_panel(self, frame: ttk.Frame, n: int):
@@ -441,8 +465,28 @@ class App:
                 defaultextension=".csv",
                 filetypes=[("CSV","*.csv")]
             )
-            if not path: return
-            self.scope.export_all_channels_csv(path)
+            if not path:
+                return
+
+            gran = (self.csv_gran.get() or "screen").lower()
+            custom_pts = None
+            if gran == "custom":
+                try:
+                    custom_pts = int(self.csv_points.get())
+                    if custom_pts <= 0:
+                        raise ValueError("points must be > 0")
+                except Exception:
+                    messagebox.showwarning(APP_TITLE, "Enter a positive integer for custom points.")
+                    return
+
+            if gran not in ("screen", "max", "custom"):
+                gran = "screen"
+
+            self.scope.export_all_channels_csv(
+                path,
+                granularity=gran,
+                custom_points=custom_pts
+            )
             self.status.set(f"Saved ALL channels → {path.split('/')[-1]}")
         except Exception as e:
             messagebox.showerror("Save ALL channels failed", str(e))

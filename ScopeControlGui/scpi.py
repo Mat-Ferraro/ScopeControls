@@ -57,11 +57,12 @@ class KeysightScope:
         # If we found scopes, show only those; otherwise show the raw USB list as a fallback
         return scopes if scopes else usb_addrs
 
-
     def connect(self, resource):
         if self.inst is not None:
-            try: self.inst.close()
-            except Exception: pass
+            try:
+                self.inst.close()
+            except Exception:
+                pass
 
         self._open_rm()
 
@@ -70,13 +71,11 @@ class KeysightScope:
             inst = self.rm.open_resource(resource)
         except pyvisa.errors.VisaIOError as e:
             if getattr(e, "error_code", None) == -1073807264:  # VI_ERROR_NCIC
-                # Try alternate backend(s)
                 alt_rm, alt_hint = self._try_alternate_rm(excluding=self._rm_hint_used)
                 if alt_rm is not None:
                     self.rm = alt_rm
                     self._rm_hint_used = alt_hint
-                    # retry open once
-                    inst = self.rm.open_resource(resource)
+                    inst = self.rm.open_resource(resource)  # retry once
                 else:
                     lib = getattr(getattr(self.rm, "visalib", None), "library_path", "unknown VISA lib")
                     raise RuntimeError(
@@ -91,18 +90,27 @@ class KeysightScope:
             else:
                 raise
 
+        # Standard session setup
         inst.timeout = 10000
         inst.read_termination = "\n"
         inst.write_termination = "\n"
-        # Bigger chunks for screenshots / waveform reads
         try:
             inst.chunk_size = max(getattr(inst, "chunk_size", 20000), 1024 * 1024)
         except Exception:
             pass
 
+        # IMPORTANT: clear any stale I/O and error queue before the first query
+        try:
+            inst.clear()   # VISA device clear (flush pending output)
+            inst.write("*CLS")  # clear status/error queue
+        except Exception:
+            pass
+
+        # First query only after buffers are clean
         idn = inst.query("*IDN?")
         self.inst = inst
         return idn
+
 
     def _open_rm(self):
         if self.rm is not None:
@@ -348,48 +356,102 @@ class KeysightScope:
         meta = {"points": points, "xincr": xincr, "xorig": xorig, "xref": xref, "yincr": yincr, "yorig": yorig, "yref": yref}
         return t_vals, y_vals, meta
 
-    def export_all_channels_csv(self, path:str):
-        channels = [f"CHAN{i}" for i in range(1,5)]
-        data = {}
-        first_t = None
-        max_len = 0
-        ok = []
-        for src in channels:
+    def wav_get_setup(self):
+        self.ensure()
+        mode = self.inst.query(":WAV:POIN:MODE?").strip()
+        pts  = int(float(self.inst.query(":WAV:POIN?")))
+        return mode, pts
+
+    def wav_set_setup(self, mode: str | None = None, points: int | None = None):
+        """Set waveform transfer setup. mode in {'NORM','MAX'} (RAW treated like MAX on many models)."""
+        self.ensure()
+        if mode:
             try:
-                t_vals, y_vals, meta = self._read_waveform_ascii(src)
-                data[src] = (t_vals, y_vals, meta)
-                if first_t is None: first_t = t_vals
-                max_len = max(max_len, len(t_vals))
-                ok.append(src)
+                self.inst.write(f":WAV:POIN:MODE {mode}")
             except Exception:
-                continue
-        if not ok:
-            raise RuntimeError("No channel data could be read.")
-        t_out = None
-        for src in ok:
-            if len(data[src][0]) == max_len:
-                t_out = data[src][0]; break
-        if t_out is None: t_out = first_t
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["# channels_ok", ",".join(ok)])
+                # Some firmwares don’t like RAW; try MAX as a safe fallback
+                if mode.upper() == "RAW":
+                    self.inst.write(":WAV:POIN:MODE MAX")
+        if points is not None:
+            self.inst.write(f":WAV:POIN {int(points)}")
+
+    def export_all_channels_csv(self, path: str, granularity: str = "screen", custom_points: int | None = None):
+        """
+        granularity: 'screen' -> :WAV:POIN:MODE NORM
+                    'max'    -> :WAV:POIN:MODE MAX
+                    'custom' -> :WAV:POIN <custom_points>
+        """
+        # Save current setup
+        prev_mode, prev_pts = self.wav_get_setup()
+
+        # Apply requested granularity
+        try:
+            if granularity == "screen":
+                self.wav_set_setup(mode="NORM", points=None)
+            elif granularity == "max":
+                self.wav_set_setup(mode="MAX", points=None)
+            elif granularity == "custom" and custom_points and custom_points > 0:
+                # Keep current MODE; just request N points
+                self.wav_set_setup(points=custom_points)
+            else:
+                # default to screen if input is odd
+                self.wav_set_setup(mode="NORM", points=None)
+        except Exception:
+            # If anything fails, fall back to current settings
+            pass
+
+        # Do the capture using your existing logic
+        try:
+            channels = [f"CHAN{i}" for i in range(1,5)]
+            data = {}
+            first_t = None
+            max_len = 0
+            ok = []
+            for src in channels:
+                try:
+                    t_vals, y_vals, meta = self._read_waveform_ascii(src)
+                    data[src] = (t_vals, y_vals, meta)
+                    if first_t is None: first_t = t_vals
+                    max_len = max(max_len, len(t_vals))
+                    ok.append(src)
+                except Exception:
+                    continue
+            if not ok:
+                raise RuntimeError("No channel data could be read.")
+            t_out = None
             for src in ok:
-                meta = data[src][2]
-                w.writerow([f"# {src}_points", meta["points"]])
-                w.writerow([f"# {src}_xincr_s", meta["xincr"]])
-                w.writerow([f"# {src}_xorig_s", meta["xorig"]])
-                w.writerow([f"# {src}_yincr_V", meta["yincr"]])
-                w.writerow([f"# {src}_yorig_V", meta["yorig"]])
-            header = ["time_s"] + [f"{src}_V" for src in channels]
-            w.writerow(header)
-            for i in range(max_len):
-                row = []
-                t = t_out[i] if i < len(t_out) else ""
-                row.append(f"{t:.12g}" if t != "" else "")
-                for src in channels:
-                    if src in data and i < len(data[src][1]):
-                        y = data[src][1][i]
-                        row.append(f"{y:.12g}")
-                    else:
-                        row.append("")
-                w.writerow(row)
+                if len(data[src][0]) == max_len:
+                    t_out = data[src][0]; break
+            if t_out is None: t_out = first_t
+            import csv as _csv
+            with open(path, "w", newline="") as f:
+                w = _csv.writer(f)
+                w.writerow(["# granularity", granularity if granularity != "custom" else f"custom:{custom_points}"])
+                w.writerow(["# wav_mode_before", prev_mode])
+                w.writerow(["# wav_points_before", prev_pts])
+                w.writerow(["# channels_ok", ",".join(ok)])
+                for src in ok:
+                    meta = data[src][2]
+                    w.writerow([f"# {src}_points", meta["points"]])
+                    w.writerow([f"# {src}_xincr_s", meta["xincr"]])
+                    w.writerow([f"# {src}_xorig_s", meta["xorig"]])
+                    w.writerow([f"# {src}_yincr_V", meta["yincr"]])
+                    w.writerow([f"# {src}_yorig_V", meta["yorig"]])
+                header = ["time_s"] + [f"{src}_V" for src in channels]
+                w.writerow(header)
+                for i in range(max_len):
+                    row = []
+                    t = t_out[i] if i < len(t_out) else ""
+                    row.append(f"{t:.12g}" if t != "" else "")
+                    for src in channels:
+                        if src in data and i < len(data[src][1]):
+                            y = data[src][1][i]; row.append(f"{y:.12g}")
+                        else:
+                            row.append("")
+                    w.writerow(row)
+        finally:
+            # Restore previous setup so normal front-panel behavior is unchanged
+            try:
+                self.wav_set_setup(mode=prev_mode, points=prev_pts)
+            except Exception:
+                pass
