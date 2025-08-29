@@ -1,5 +1,6 @@
 # scpi.py
 # SCPI/pyvisa wrapper for Keysight DSOX 1000 series (tested on DSOX1204G style commands)
+# Standard Commands for Programmable Instruments
 import os, csv
 import pyvisa
 
@@ -202,26 +203,71 @@ class KeysightScope:
         }
 
     # --- Trigger ---
-    def trig_apply(self, ttype:str, src:str, level_v:float, slope:str, coup:str, sweep:str, hold_s:float):
+    def trig_apply(self, ttype: str, src: str, level_v: float, slope: str, coup: str, sweep: str, hold_s: float | None):
         self.ensure()
-        self.inst.write(f":TRIG:MODE {ttype}")
-        self.inst.write(f":TRIG:EDGE:SOUR {src}")   # EDGE only wired
-        self.inst.write(f":TRIG:EDGE:SLOP {slope}")
-        self.inst.write(f":TRIG:EDGE:COUP {coup}")
-        self.inst.write(f":TRIG:SWEEP {sweep}")
-        self.inst.write(f":TRIG:LEV {src},{level_v:.9g}")
-        self.inst.write(f":TRIG:HOLD {hold_s:.9g}")
-        got_mode = self.inst.query(":TRIG:MODE?").strip()
-        got_src  = self.inst.query(":TRIG:EDGE:SOUR?").strip()
-        got_slp  = self.inst.query(":TRIG:EDGE:SLOP?").strip()
-        got_coup = self.inst.query(":TRIG:EDGE:COUP?").strip()
-        got_swp  = self.inst.query(":TRIG:SWEEP?").strip()
+
+        # Flush anything left over so we don't trip -410 later
         try:
-            got_lev = float(self.inst.query(f":TRIG:LEV? {src}"))
+            self.inst.clear()
+            self.inst.write("*CLS")
         except Exception:
-            got_lev = float(self.inst.query(":TRIG:LEV?"))
-        got_hold = float(self.inst.query(":TRIG:HOLD?"))
+            pass
+
+        # Configure (writes only)
+        self.inst.write(f":TRIG:MODE {ttype}")
+        self.inst.write(f":TRIG:EDGE:SOUR {src}")
+        self.inst.write(f":TRIG:EDGE:SLOP {slope}")
+        if src != "LINE":
+            self.inst.write(f":TRIG:EDGE:COUP {coup}")
+        self.inst.write(f":TRIG:SWEEP {sweep}")
+
+        if src != "LINE":
+            # Prefer per-source form; fallback to global if not supported
+            try:
+                self.inst.write(f":TRIG:LEV {src},{level_v:.9g}")
+            except Exception:
+                self.inst.write(f":TRIG:LEV {level_v:.9g}")
+
+        # Holdoff: only set when positive numeric; otherwise leave unchanged
+        try:
+            if hold_s is not None and hold_s > 0:
+                self.inst.write(f":TRIG:HOLD {hold_s:.9g}")
+        except Exception:
+            # ignore harmless holdoff set errors
+            pass
+
+        # Minimal, resilient readback (avoid leaving partial replies)
+        try:
+            got_mode = self.inst.query(":TRIG:MODE?").strip()
+            got_src  = self.inst.query(":TRIG:EDGE:SOUR?").strip()
+            got_slp  = self.inst.query(":TRIG:EDGE:SLOP?").strip()
+            got_coup = self.inst.query(":TRIG:EDGE:COUP?").strip() if src != "LINE" else "N/A"
+            got_swp  = self.inst.query(":TRIG:SWEEP?").strip()
+            try:
+                got_lev = float(self.inst.query(f":TRIG:LEV? {src}")) if src != "LINE" else float("nan")
+            except Exception:
+                got_lev = float(self.inst.query(":TRIG:LEV?")) if src != "LINE" else float("nan")
+            got_hold = float(self.inst.query(":TRIG:HOLD?"))
+        except pyvisa.errors.VisaIOError as e:
+            # If we still hit -410 (Query UNTERMINATED) or -363, clear and return partials
+            if getattr(e, "error_code", None) in (-410, -363):
+                try:
+                    self.inst.clear(); self.inst.write("*CLS")
+                except Exception:
+                    pass
+                # Return "unknown" for fields we couldn't query
+                got_mode = ttype
+                got_src  = src
+                got_slp  = slope
+                got_coup = coup if src != "LINE" else "N/A"
+                got_swp  = sweep
+                got_lev  = float("nan") if src == "LINE" else level_v
+                got_hold = float("nan")
+            else:
+                raise
+
         return got_mode, got_src, got_slp, got_coup, got_swp, got_lev, got_hold
+
 
     # --- Measurements ---
     def meas_set_window(self, win:str):
