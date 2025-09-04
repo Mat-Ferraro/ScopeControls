@@ -3,6 +3,7 @@
 # Standard Commands for Programmable Instruments
 import os, csv
 import pyvisa
+import pathlib
 
 from units import parse_time_s, parse_volt_v, fmt_s, fmt_v
 from meas import UNIT_FORMATTERS
@@ -41,6 +42,9 @@ class KeysightScope:
                 inst.timeout = 3000
                 inst.read_termination = "\n"
                 inst.write_termination = "\n"
+
+                inst.chunk_size = 64 * 1024      # 64 KiB like the working code
+
                 idn = inst.query("*IDN?").strip().upper()
                 inst.close()
 
@@ -141,6 +145,120 @@ class KeysightScope:
     def ensure(self):
         if self.inst is None:
             raise RuntimeError("Not connected")
+        
+    def acq_is_stopped(self) -> bool:
+        """Return True if the scope is in a stopped/held state (ok to save)."""
+        self.ensure()
+        try:
+            st = self.inst.query(":TRIG:STATE?").strip().upper()
+            # Keysight typically reports RUN, STOP, WAIT, etc. Single ends in HOLD/STOP depending on model.
+            return st in ("STOP", "HOLD")
+        except Exception:
+            # If unsure, fail closed (treat as not stopped)
+            return False
+
+        
+    def _drain_input(self, timeout_ms: int = 100):
+        """Non-blocking drain of any leftover bytes (e.g., a trailing LF) to avoid -410/-420."""
+        from pyvisa.errors import VisaIOError
+        old_to = self.inst.timeout
+        try:
+            self.inst.timeout = max(1, timeout_ms)
+            while True:
+                try:
+                    chunk = self.inst.read_raw()
+                    if not chunk:
+                        break
+                except VisaIOError:
+                    break  # nothing pending
+        finally:
+            self.inst.timeout = old_to
+
+        def _drain_after_block(self, timeout_ms: int = 60):
+            """Consume any trailing LF/CRLF left after a binary block, without blocking."""
+            from pyvisa.errors import VisaIOError
+            self.ensure()
+            old_to = self.inst.timeout
+            try:
+                self.inst.timeout = max(20, timeout_ms)
+                while True:
+                    try:
+                        b = self.inst.read_raw()
+                        if not b:
+                            break
+                        # typically just b"\n" or b"\r\n"; ignore contents
+                        if len(b) > 2:
+                            # very unlikely; stop to avoid eating actual next reply
+                            break
+                    except VisaIOError:
+                        break
+            finally:
+                self.inst.timeout = old_to
+ 
+
+    def _read_ieee_block(self, cmd: str) -> bytes:
+        """
+        Issue a query that returns an IEEE-488.2 definite-length block (#<n><len><payload>)
+        and return exactly the <payload> bytes. Handles split headers and drains
+        any trailing terminator after the block.
+        """
+        from pyvisa.errors import VisaIOError
+
+        self.ensure()
+
+        # Start clean but do NOT device-clear (can interrupt pending I/O)
+        try:
+            self._drain_input(50)
+        except Exception:
+            pass
+
+        # Temporarily disable read termination for binary block read
+        old_rt = self.inst.read_termination
+        try:
+            self.inst.read_termination = None
+
+            # Send the query
+            self.inst.write(cmd)
+
+            # 1) Read '#' and ndigits
+            b = self.inst.read_bytes(1, break_on_termchar=False)
+            if not b or b != b"#":
+                # Fallback: if instrument responded differently, grab all available
+                rest = b + self.inst.read_raw()
+                return rest
+
+            nd = self.inst.read_bytes(1, break_on_termchar=False)
+            if len(nd) != 1 or not nd.isdigit():
+                raise RuntimeError("Malformed block header (ndigits).")
+            ndigits = int(nd)
+
+            # 2) Read the length field (ndigits ASCII digits)
+            length_bytes = self.inst.read_bytes(ndigits, break_on_termchar=False)
+            if len(length_bytes) != ndigits or not length_bytes.isdigit():
+                raise RuntimeError("Malformed block header (length).")
+            total_len = int(length_bytes.decode("ascii"))
+
+            # 3) Read exactly total_len payload bytes
+            payload = bytearray()
+            remaining = total_len
+            while remaining > 0:
+                chunk = self.inst.read_bytes(remaining, break_on_termchar=False)
+                if not chunk:
+                    raise VisaIOError(-1073807339)  # VI_ERROR_TMO
+                payload.extend(chunk)
+                remaining -= len(chunk)
+
+        finally:
+            self.inst.read_termination = old_rt
+
+        # 4) Drain a trailing LF/CRLF if present so the next query starts clean
+        try:
+            self._drain_input(100)
+        except Exception:
+            pass
+
+        return bytes(payload)
+
 
     # --- Timebase ---
     def tim_set_main(self, scale_s: float, ref: str, pos_s: float|None):
@@ -308,7 +426,7 @@ class KeysightScope:
         self.inst.write(":MEAS:CLEar")
 
     # --- Export ---
-    def export_screenshot_png(self, path:str):
+    def export_screenshot_png(self, path: str):
         self.ensure()
         self.inst.write(":DISP:DATA? PNG")
         data = self.inst.read_raw()
@@ -320,41 +438,89 @@ class KeysightScope:
         with open(path, "wb") as f:
             f.write(payload)
 
-    def _read_waveform_ascii(self, src:str):
+        try: self._drain_after_block()
+        except Exception: pass
+
+    def _read_waveform_binary(self, src: str, points: int | str = "max"):
         self.ensure()
-        self.inst.write(f":WAV:SOUR {src}")
-        self.inst.write(":WAV:FORM ASC")
-        pre = self.inst.query(":WAV:PRE?").strip().split(",")
-        if len(pre) < 10:
-            raise RuntimeError(f"Unexpected preamble for {src}: {pre}")
-        points = int(float(pre[2]))
-        xincr  = float(pre[4]); xorig = float(pre[5]); xref = float(pre[6])
-        yincr  = float(pre[7]); yorig = float(pre[8]); yref = float(pre[9])
-        self.inst.write(":WAV:DATA?")
-        raw = self.inst.read_raw()
-        if raw.startswith(b"#"):
-            nd = int(raw[1:2]); length = int(raw[2:2+nd]); start = 2+nd
-            payload = raw[start:start+length].decode("ascii", errors="ignore")
-        else:
-            payload = raw.decode("ascii", errors="ignore")
-        y_vals = []
-        for piece in payload.strip().split(","):
-            piece = piece.strip()
-            if not piece: continue
-            try:
-                y_vals.append(float(piece))
-            except ValueError:
-                break
-        def need_scale(vals):
-            if not vals: return False
-            ints_like = sum(1 for v in vals[:100] if abs(v - round(v)) < 1e-6)
-            return ints_like > 80 and (abs(yincr-1.0) > 1e-9 or abs(yorig) > 1e-12 or abs(yref) > 1e-9)
-        if need_scale(y_vals):
-            y_vals = [(v - yref) * yincr + yorig for v in y_vals]
-        n = len(y_vals)
-        t_vals = [xorig + (k - xref) * xincr for k in range(n)]
-        meta = {"points": points, "xincr": xincr, "xorig": xorig, "xref": xref, "yincr": yincr, "yorig": yorig, "yref": yref}
-        return t_vals, y_vals, meta
+
+        # Always read from MAIN for deepest record (as you already have)
+        try:
+            tmode = self.inst.query(":TIMebase:MODE?").strip().upper()
+        except Exception:
+            tmode = "MAIN"
+        restore_zoom = tmode.startswith("WIND")
+        if restore_zoom:
+            try: self.inst.write(":TIMebase:MODE MAIN")
+            except Exception: restore_zoom = False
+
+        try:
+            self.inst.write(f":WAVeform:SOURce {src}")
+            self.inst.write(":WAVeform:FORMat BYTE")
+
+            if isinstance(points, int) and points > 0:
+                try: self.inst.write(":WAVeform:POINts:MODE RAW")
+                except Exception: self.inst.write(":WAVeform:POINts:MODE MAX")
+                self.inst.write(f":WAVeform:POINts {int(points)}")
+            elif isinstance(points, str) and points.lower().startswith("max"):
+                used_exact = False
+                try:
+                    max_pts = int(float(self.inst.query(":WAVeform:POINts:MAX?")))
+                    if max_pts > 0:
+                        try: self.inst.write(":WAVeform:POINts:MODE RAW")
+                        except Exception: self.inst.write(":WAVeform:POINts:MODE MAX")
+                        self.inst.write(f":WAVeform:POINts {max_pts}")
+                        used_exact = True
+                except Exception:
+                    pass
+                if not used_exact:
+                    self.inst.write(":WAVeform:POINts:MODE MAX")
+            else:
+                self.inst.write(":WAVeform:POINts:MODE NORMal")
+
+            pts = int(float(self.inst.query(":WAVeform:POINts?")))
+            if pts < 1000 and (points != "screen"):
+                try:
+                    self.inst.write(":WAVeform:POINts:MODE RAW")
+                    self.inst.write(":WAVeform:POINts 1000000")
+                    pts = int(float(self.inst.query(":WAVeform:POINts?")))
+                except Exception:
+                    pass
+                if pts < 1000:
+                    try:
+                        self.inst.write(":WAVeform:POINts:MODE MAX")
+                        pts = int(float(self.inst.query(":WAVeform:POINts?")))
+                    except Exception:
+                        pass
+                    if pts < 1:
+                        raise RuntimeError(f"No points available on {src}")
+
+            pre = self.inst.query(":WAVeform:PREamble?").strip().split(',')
+            if len(pre) < 10:
+                raise RuntimeError(f"Unexpected preamble for {src}: {pre}")
+            x_incr = float(pre[4]); x_orig = float(pre[5]); x_ref = float(pre[6])
+            y_incr = float(pre[7]); y_orig = float(pre[8]); y_ref = float(pre[9])
+
+            # --- Binary transfer ---
+            payload = self.inst.query_binary_values(":WAVeform:DATA?", datatype='B', container=bytes)
+
+            # >>> Critical: eat the trailing LF so the next query doesn't trip -410
+            self._drain_after_block()
+
+            if not payload:
+                raise RuntimeError(f"No data for {src}")
+
+            y_vals = [(b - y_ref) * y_incr + y_orig for b in payload]
+            n = len(y_vals)
+            t_vals = [x_orig + x_incr * (i - x_ref) for i in range(n)]
+            meta = {"points": pts, "xincr": x_incr, "xorig": x_orig, "xref": x_ref,
+                    "yincr": y_incr, "yorig": y_orig, "yref": y_ref}
+            return t_vals, y_vals, meta
+        finally:
+            if restore_zoom:
+                try: self.inst.write(":TIMebase:MODE WIND")
+                except Exception: pass
+
 
     def wav_get_setup(self):
         self.ensure()
@@ -375,83 +541,112 @@ class KeysightScope:
         if points is not None:
             self.inst.write(f":WAV:POIN {int(points)}")
 
-    def export_all_channels_csv(self, path: str, granularity: str = "screen", custom_points: int | None = None):
+    def export_all_channels_csv(self, path: str, granularity: str = "max", custom_points: int | None = None):
         """
-        granularity: 'screen' -> :WAV:POIN:MODE NORM
-                    'max'    -> :WAV:POIN:MODE MAX
-                    'custom' -> :WAV:POIN <custom_points>
+        Build one CSV on the PC with columns: time_s, CHANnel1_V..CHANnel4_V
+        Uses MAIN timebase and requests deepest possible record (MAX; fallback to 10k).
         """
-        # Save current setup
-        prev_mode, prev_pts = self.wav_get_setup()
+        import csv as _csv
 
-        # Apply requested granularity
+        self.ensure()
+
+        # One-time clean at start (like your working project)
         try:
-            if granularity == "screen":
-                self.wav_set_setup(mode="NORM", points=None)
-            elif granularity == "max":
-                self.wav_set_setup(mode="MAX", points=None)
-            elif granularity == "custom" and custom_points and custom_points > 0:
-                # Keep current MODE; just request N points
-                self.wav_set_setup(points=custom_points)
-            else:
-                # default to screen if input is odd
-                self.wav_set_setup(mode="NORM", points=None)
+            self.inst.clear()
+            self.inst.write("*CLS")
+            self.inst.write("*WAI")
         except Exception:
-            # If anything fails, fall back to current settings
             pass
 
-        # Do the capture using your existing logic
+        # Temporarily force MAIN (deepest record); restore ZOOM at the end
         try:
-            channels = [f"CHAN{i}" for i in range(1,5)]
-            data = {}
-            first_t = None
-            max_len = 0
-            ok = []
-            for src in channels:
+            prev_tmode = self.inst.query(":TIMebase:MODE?").strip().upper()
+        except Exception:
+            prev_tmode = "MAIN"
+        try:
+            if prev_tmode.startswith("WIND"):
+                self.inst.write(":TIMebase:MODE MAIN")
+        except Exception:
+            pass
+
+        try:
+            # Global waveform setup (simple & stable, like the working repo)
+            self.inst.write(":WAVeform:FORMat BYTE")
+            # Ask for maximum points first; we'll still handle 0 by falling back to NORM/10k
+            try:
+                self.inst.write(":WAVeform:POINts:MODE MAX")
+            except Exception:
+                self.inst.write(":WAVeform:POINts:MODE NORMal")
+
+            channels = [f"CHANnel{i}" for i in range(1, 5)]
+            time_axis = None
+            data_cols = {}  # name -> list[float]
+
+            for ch in range(1, 5):
+                src = f"CHANnel{ch}"
                 try:
-                    t_vals, y_vals, meta = self._read_waveform_ascii(src)
-                    data[src] = (t_vals, y_vals, meta)
-                    if first_t is None: first_t = t_vals
-                    max_len = max(max_len, len(t_vals))
-                    ok.append(src)
+                    # Skip channels that are not displayed
+                    disp = self.inst.query(f":CHANnel{ch}:DISPlay?").strip().upper()
+                    if disp in ("0", "OFF"):
+                        continue
+
+                    # Select source
+                    self.inst.write(f":WAVeform:SOURce {src}")
+
+                    # Ensure we actually have points; if 0, fall back to NORM/10k (working pattern)
+                    pts = int(float(self.inst.query(":WAVeform:POINts?")))
+                    if pts == 0:
+                        self.inst.write(":WAVeform:POINts:MODE NORMal")
+                        self.inst.write(":WAVeform:POINts 10000")
+                        pts = int(float(self.inst.query(":WAVeform:POINts?")))
+                        if pts == 0:
+                            continue  # nothing to read for this channel
+
+                    # Preamble (scales)
+                    pre = self.inst.query(":WAVeform:PREamble?").strip().split(',')
+                    if len(pre) < 10:
+                        continue
+                    x_incr = float(pre[4]); x_orig = float(pre[5]); x_ref = float(pre[6])
+                    y_incr = float(pre[7]); y_orig = float(pre[8]); y_ref = float(pre[9])
+
+                    # Binary waveform transfer (VISA consumes the #<n><len> block)
+                    payload = self.inst.query_binary_values(":WAVeform:DATA?", datatype='B', container=bytes)
+                    if not payload:
+                        continue
+
+                    # Scale to volts and assemble time on first successful channel
+                    y_vals = [(b - y_ref) * y_incr + y_orig for b in payload]
+                    n = len(y_vals)
+                    if time_axis is None:
+                        time_axis = [x_orig + x_incr * (i - x_ref) for i in range(n)]
+                    data_cols[f"{src}_V"] = y_vals
+
                 except Exception:
+                    # keep going; other channels may succeed
                     continue
-            if not ok:
-                raise RuntimeError("No channel data could be read.")
-            t_out = None
-            for src in ok:
-                if len(data[src][0]) == max_len:
-                    t_out = data[src][0]; break
-            if t_out is None: t_out = first_t
-            import csv as _csv
+
+            if not data_cols or time_axis is None:
+                raise RuntimeError("No waveform data retrieved.")
+
+            # Align columns: trim to shortest length
+            min_len = min(len(col) for col in data_cols.values())
+            time_axis = time_axis[:min_len]
+            for k in list(data_cols.keys()):
+                data_cols[k] = data_cols[k][:min_len]
+
+            # Write CSV
+            headers = ["time_s"] + [f"{src}_V" for src in channels]
             with open(path, "w", newline="") as f:
                 w = _csv.writer(f)
-                w.writerow(["# granularity", granularity if granularity != "custom" else f"custom:{custom_points}"])
-                w.writerow(["# wav_mode_before", prev_mode])
-                w.writerow(["# wav_points_before", prev_pts])
-                w.writerow(["# channels_ok", ",".join(ok)])
-                for src in ok:
-                    meta = data[src][2]
-                    w.writerow([f"# {src}_points", meta["points"]])
-                    w.writerow([f"# {src}_xincr_s", meta["xincr"]])
-                    w.writerow([f"# {src}_xorig_s", meta["xorig"]])
-                    w.writerow([f"# {src}_yincr_V", meta["yincr"]])
-                    w.writerow([f"# {src}_yorig_V", meta["yorig"]])
-                header = ["time_s"] + [f"{src}_V" for src in channels]
-                w.writerow(header)
-                for i in range(max_len):
-                    row = []
-                    t = t_out[i] if i < len(t_out) else ""
-                    row.append(f"{t:.12g}" if t != "" else "")
-                    for src in channels:
-                        if src in data and i < len(data[src][1]):
-                            y = data[src][1][i]; row.append(f"{y:.12g}")
-                        else:
-                            row.append("")
+                w.writerow(headers)
+                for i in range(min_len):
+                    row = [f"{time_axis[i]:.12g}"] + [f"{data_cols.get(h, [])[:min_len][i]:.12g}" if h in data_cols else "" for h in [f"{src}_V" for src in channels]]
                     w.writerow(row)
+
         finally:
-            # Restore previous setup so normal front-panel behavior is unchanged
+            # Restore previous timebase if we changed it
             try:
-                self.wav_set_setup(mode=prev_mode, points=prev_pts)
+                if prev_tmode.startswith("WIND"):
+                    self.inst.write(":TIMebase:MODE WIND")
             except Exception:
                 pass

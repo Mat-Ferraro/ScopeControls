@@ -189,6 +189,8 @@ class App:
             .grid(row=0, column=3, sticky="w", padx=(8,4), pady=(4,6))
         ttk.Button(exp, text="Save ALL Channels (CSV)", command=self.export_all_waveforms_csv)\
             .grid(row=0, column=4, sticky="w", padx=(4,8), pady=(4,6))
+        # ttk.Button(exp, text="Open Folder", command=self.open_last_folder)\
+        #     .grid(row=0, column=5, sticky="w", padx=(4,8), pady=(4,6))
 
         # Enable/disable points entry based on selection
         def _on_gran_change(*_):
@@ -459,6 +461,7 @@ class App:
             messagebox.showerror("Screenshot failed", str(e))
 
     def export_all_waveforms_csv(self):
+        from tkinter import filedialog, messagebox
         try:
             path = filedialog.asksaveasfilename(
                 title="Save ALL Channels CSV",
@@ -468,25 +471,10 @@ class App:
             if not path:
                 return
 
-            gran = (self.csv_gran.get() or "screen").lower()
-            custom_pts = None
-            if gran == "custom":
-                try:
-                    custom_pts = int(self.csv_points.get())
-                    if custom_pts <= 0:
-                        raise ValueError("points must be > 0")
-                except Exception:
-                    messagebox.showwarning(APP_TITLE, "Enter a positive integer for custom points.")
-                    return
-
-            if gran not in ("screen", "max", "custom"):
-                gran = "screen"
-
-            self.scope.export_all_channels_csv(
-                path,
-                granularity=gran,
-                custom_points=custom_pts
-            )
+            self.scope.export_all_channels_csv(path)
             self.status.set(f"Saved ALL channels → {path.split('/')[-1]}")
+            messagebox.showinfo(APP_TITLE, f"Saved CSV:\n{path}")
+
         except Exception as e:
             messagebox.showerror("Save ALL channels failed", str(e))
+
