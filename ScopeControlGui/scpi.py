@@ -425,21 +425,39 @@ class KeysightScope:
         self.ensure()
         self.inst.write(":MEAS:CLEar")
 
+
     # --- Export ---
     def export_screenshot_png(self, path: str):
+        """Capture the current screen as a real PNG file using a robust block reader."""
         self.ensure()
-        self.inst.write(":DISP:DATA? PNG")
-        data = self.inst.read_raw()
-        if data and data[:1] == b"#":
-            nd = int(data[1:2]); length = int(data[2:2+nd]); start = 2+nd
-            payload = data[start:start+length]
-        else:
-            payload = data
+
+        # Try common Keysight variants first
+        try_cmds = [
+            ":DISP:DATA? PNG",
+            ":DISPlay:DATA? PNG,SCReen",
+        ]
+        payload = None
+        for cmd in try_cmds:
+            try:
+                payload = self._read_ieee_block(cmd)
+                # Quick sanity check: PNG magic
+                if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+                    break
+            except Exception:
+                payload = None
+
+        # Fallback: older firmware via hardcopy path
+        if not payload:
+            try:
+                self.inst.write(":HCOPy:SDUMp:DATA 1")  # send to interface
+            except Exception:
+                pass
+            self.inst.write(":HCOPy:DEV:LANG PNG")
+            payload = self._read_ieee_block(":HCOPy:DATA?")
+
         with open(path, "wb") as f:
             f.write(payload)
 
-        try: self._drain_after_block()
-        except Exception: pass
 
     def _read_waveform_binary(self, src: str, points: int | str = "max"):
         self.ensure()
@@ -541,112 +559,98 @@ class KeysightScope:
         if points is not None:
             self.inst.write(f":WAV:POIN {int(points)}")
 
-    def export_all_channels_csv(self, path: str, granularity: str = "max", custom_points: int | None = None):
-        """
-        Build one CSV on the PC with columns: time_s, CHANnel1_V..CHANnel4_V
-        Uses MAIN timebase and requests deepest possible record (MAX; fallback to 10k).
+    def export_all_channels_csv(self, path: str, granularity: str = "max", custom_points: int | None = None, chunk_rows: int = 20000):
+        """Export all visible channels to CSV efficiently (streaming, low memory).
+
+        Columns: time_s, CHANnel1_V..CHANnel4_V (only visible channels included).
+        granularity: 'screen' (current points), 'max' (deepest), or 'custom' with custom_points.
+        chunk_rows: how many rows to buffer per write batch.
         """
         import csv as _csv
+        import math
 
         self.ensure()
-
-        # One-time clean at start (like your working project)
+        # Slightly raise chunk size for faster transfers (pyvisa attribute)
         try:
-            self.inst.clear()
-            self.inst.write("*CLS")
-            self.inst.write("*WAI")
+            if getattr(self.inst, 'chunk_size', None) and self.inst.chunk_size < 1024*1024:
+                self.inst.chunk_size = 1024*1024
         except Exception:
             pass
 
-        # Temporarily force MAIN (deepest record); restore ZOOM at the end
+        # Decide points mode
+        mode = "MAX" if granularity.lower() == "max" else ("NORM" if granularity.lower() == "screen" else "MAX")
+        points = None
+        if granularity.lower() == "custom" and custom_points:
+            mode = "NORM"   # many firmwares require NORM to honor explicit points
+            points = int(custom_points)
+
+        # Snapshot and configure waveform transfer
+        prev_mode = self.inst.query(":WAV:POIN:MODE?").strip()
+        prev_pts  = int(float(self.inst.query(":WAV:POIN?")))
+
+        # Common, fast transfer settings
+        self.inst.write(":WAV:FORM BYTE")
+        try: self.inst.write(":WAV:BYT LSBF")
+        except Exception: pass
+        try: self.inst.write(":WAV:UNS 1")
+        except Exception: pass
+
+        # Apply requested depth
         try:
-            prev_tmode = self.inst.query(":TIMebase:MODE?").strip().upper()
+            self.inst.write(f":WAV:POIN:MODE {mode}")
         except Exception:
-            prev_tmode = "MAIN"
+            if mode.upper() == "RAW":
+                self.inst.write(":WAV:POIN:MODE MAX")
+
+        if points is not None:
+            self.inst.write(f":WAV:POIN {points}")
+
+        # Find which channels are visible
+        channels = [i for i in range(1,5) if self.inst.query(f":CHAN{i}:DISP?").strip() in ("1","ON")]
+        if not channels:
+            channels = [1]
+
+        # Query preamble from one reference channel for time axis
+        ref_ch = channels[0]
+        self.inst.write(f":WAV:SOUR CHAN{ref_ch}")
+        pre = self.inst.query(":WAV:PRE?").strip().split(',')
+        # Keysight preamble: FORMAT, TYPE, POINTS, COUNT, XINC, XORIG, XREF, YINC, YORIG, YREF
+        xinc = float(pre[4]); xorig = float(pre[5]); xref = float(pre[6])
+        # points after configuration
+        npts = int(float(self.inst.query(":WAV:POIN?")))
+
+        # Read each channel's raw bytes and convert to float volts arrays lazily
+        data_cols = []
+        for ch in channels:
+            self.inst.write(f":WAV:SOUR CHAN{ch}")
+            pre = self.inst.query(":WAV:PRE?").strip().split(',')
+            yinc = float(pre[7]); yorig = float(pre[8]); yref = float(pre[9])
+            raw = self._read_ieee_block(":WAV:DATA?")  # bytes length == npts
+            mv = memoryview(raw)
+            col = [(b - yref) * yinc + yorig for b in mv]
+            data_cols.append((f"CHANnel{ch}_V", col))
+
+        # Stream to CSV in chunks to keep UI responsive (when called from a worker thread)
+        headers = ["time_s"] + [name for name,_ in data_cols]
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(headers)
+            i = 0
+            while i < npts:
+                j = min(i + chunk_rows, npts)
+                rows = []
+                for k in range(i, j):
+                    t = (k - xref) * xinc + xorig
+                    row = [f"{t:.12g}"]
+                    for _, col in data_cols:
+                        row.append(f"{col[k]:.12g}")
+                    rows.append(row)
+                w.writerows(rows)
+                i = j
+
+        # restore previous setup
         try:
-            if prev_tmode.startswith("WIND"):
-                self.inst.write(":TIMebase:MODE MAIN")
+            self.inst.write(f":WAV:POIN:MODE {prev_mode}")
+            self.inst.write(f":WAV:POIN {prev_pts}")
         except Exception:
             pass
-
-        try:
-            # Global waveform setup (simple & stable, like the working repo)
-            self.inst.write(":WAVeform:FORMat BYTE")
-            # Ask for maximum points first; we'll still handle 0 by falling back to NORM/10k
-            try:
-                self.inst.write(":WAVeform:POINts:MODE MAX")
-            except Exception:
-                self.inst.write(":WAVeform:POINts:MODE NORMal")
-
-            channels = [f"CHANnel{i}" for i in range(1, 5)]
-            time_axis = None
-            data_cols = {}  # name -> list[float]
-
-            for ch in range(1, 5):
-                src = f"CHANnel{ch}"
-                try:
-                    # Skip channels that are not displayed
-                    disp = self.inst.query(f":CHANnel{ch}:DISPlay?").strip().upper()
-                    if disp in ("0", "OFF"):
-                        continue
-
-                    # Select source
-                    self.inst.write(f":WAVeform:SOURce {src}")
-
-                    # Ensure we actually have points; if 0, fall back to NORM/10k (working pattern)
-                    pts = int(float(self.inst.query(":WAVeform:POINts?")))
-                    if pts == 0:
-                        self.inst.write(":WAVeform:POINts:MODE NORMal")
-                        self.inst.write(":WAVeform:POINts 10000")
-                        pts = int(float(self.inst.query(":WAVeform:POINts?")))
-                        if pts == 0:
-                            continue  # nothing to read for this channel
-
-                    # Preamble (scales)
-                    pre = self.inst.query(":WAVeform:PREamble?").strip().split(',')
-                    if len(pre) < 10:
-                        continue
-                    x_incr = float(pre[4]); x_orig = float(pre[5]); x_ref = float(pre[6])
-                    y_incr = float(pre[7]); y_orig = float(pre[8]); y_ref = float(pre[9])
-
-                    # Binary waveform transfer (VISA consumes the #<n><len> block)
-                    payload = self.inst.query_binary_values(":WAVeform:DATA?", datatype='B', container=bytes)
-                    if not payload:
-                        continue
-
-                    # Scale to volts and assemble time on first successful channel
-                    y_vals = [(b - y_ref) * y_incr + y_orig for b in payload]
-                    n = len(y_vals)
-                    if time_axis is None:
-                        time_axis = [x_orig + x_incr * (i - x_ref) for i in range(n)]
-                    data_cols[f"{src}_V"] = y_vals
-
-                except Exception:
-                    # keep going; other channels may succeed
-                    continue
-
-            if not data_cols or time_axis is None:
-                raise RuntimeError("No waveform data retrieved.")
-
-            # Align columns: trim to shortest length
-            min_len = min(len(col) for col in data_cols.values())
-            time_axis = time_axis[:min_len]
-            for k in list(data_cols.keys()):
-                data_cols[k] = data_cols[k][:min_len]
-
-            # Write CSV
-            headers = ["time_s"] + [f"{src}_V" for src in channels]
-            with open(path, "w", newline="") as f:
-                w = _csv.writer(f)
-                w.writerow(headers)
-                for i in range(min_len):
-                    row = [f"{time_axis[i]:.12g}"] + [f"{data_cols.get(h, [])[:min_len][i]:.12g}" if h in data_cols else "" for h in [f"{src}_V" for src in channels]]
-                    w.writerow(row)
-
-        finally:
-            # Restore previous timebase if we changed it
-            try:
-                if prev_tmode.startswith("WIND"):
-                    self.inst.write(":TIMebase:MODE WIND")
-            except Exception:
-                pass

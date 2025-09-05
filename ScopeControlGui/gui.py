@@ -462,19 +462,29 @@ class App:
 
     def export_all_waveforms_csv(self):
         from tkinter import filedialog, messagebox
-        try:
-            path = filedialog.asksaveasfilename(
-                title="Save ALL Channels CSV",
-                defaultextension=".csv",
-                filetypes=[("CSV","*.csv")]
-            )
-            if not path:
-                return
+        import threading
 
-            self.scope.export_all_channels_csv(path)
-            self.status.set(f"Saved ALL channels → {path.split('/')[-1]}")
-            messagebox.showinfo(APP_TITLE, f"Saved CSV:\n{path}")
+        path = filedialog.asksaveasfilename(
+            title="Save ALL Channels CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV","*.csv")]
+        )
+        if not path:
+            return
 
-        except Exception as e:
-            messagebox.showerror("Save ALL channels failed", str(e))
+        self.status.set("Saving CSV… (running in background)")
 
+        def _worker():
+            try:
+                self.scope.export_all_channels_csv(
+                    path,
+                    granularity=self.csv_gran.get(),
+                    custom_points=int(self.csv_points.get()) if self.csv_gran.get() == "custom" else None
+                )
+                # marshal back to UI thread
+                self.root.after(0, lambda: (self.status.set(f"Saved ALL channels → {path.split('/')[-1]}"),
+                                            messagebox.showinfo(APP_TITLE, f"Saved CSV:\n{path}")))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Save ALL channels failed", str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
