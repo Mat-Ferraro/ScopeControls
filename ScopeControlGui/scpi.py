@@ -115,7 +115,6 @@ class KeysightScope:
         self.inst = inst
         return idn
 
-
     def _open_rm(self):
         if self.rm is not None:
             return
@@ -156,8 +155,7 @@ class KeysightScope:
         except Exception:
             # If unsure, fail closed (treat as not stopped)
             return False
-
-        
+      
     def _drain_input(self, timeout_ms: int = 100):
         """Non-blocking drain of any leftover bytes (e.g., a trailing LF) to avoid -410/-420."""
         from pyvisa.errors import VisaIOError
@@ -195,7 +193,6 @@ class KeysightScope:
             finally:
                 self.inst.timeout = old_to
  
-
     def _read_ieee_block(self, cmd: str) -> bytes:
         """
         Issue a query that returns an IEEE-488.2 definite-length block (#<n><len><payload>)
@@ -259,7 +256,6 @@ class KeysightScope:
 
         return bytes(payload)
 
-
     # --- Timebase ---
     def tim_set_main(self, scale_s: float, ref: str, pos_s: float|None):
         self.ensure()
@@ -300,6 +296,14 @@ class KeysightScope:
     def stop(self):
         self.ensure()
         self.inst.write(":STOP")
+
+    def autoscale(self):
+        self.ensure()
+        self.inst.write(":AUToscale")
+
+    def default_setup(self):
+        self.ensure()
+        self.inst.write(":SYSTem:PRESet")
 
     # --- Channels ---
     def chan_apply(self, n:int, disp:str, coup:str, bwl:str, inv:str, scale_v:float, offs_v:float, probe:float):
@@ -402,7 +406,6 @@ class KeysightScope:
 
         return got_mode, got_src, got_slp, got_coup, got_swp, got_lev, got_hold
 
-
     # --- Measurements ---
     def meas_set_window(self, win:str):
         self.ensure()
@@ -424,7 +427,6 @@ class KeysightScope:
     def meas_clear_all(self):
         self.ensure()
         self.inst.write(":MEAS:CLEar")
-
 
     # --- Export ---
     def export_screenshot_png(self, path: str):
@@ -457,7 +459,6 @@ class KeysightScope:
 
         with open(path, "wb") as f:
             f.write(payload)
-
 
     def _read_waveform_binary(self, src: str, points: int | str = "max"):
         self.ensure()
@@ -538,7 +539,6 @@ class KeysightScope:
             if restore_zoom:
                 try: self.inst.write(":TIMebase:MODE WIND")
                 except Exception: pass
-
 
     def wav_get_setup(self):
         self.ensure()
